@@ -1,0 +1,168 @@
+/********************************************************************************
+-- Proyecto: SATCOM
+-- Proceso: Migración de Usuarios con Asignación de Padre Dinámica
+-- Descripción: Migra usuarios y sus establecimientos desde sat_seguridad_w5 
+--              hacia sat_seguridad, asignando automáticamente el us_id_padre 
+--              más frecuente del emisor en el destino.
+-- Autor: KT
+-- Fecha: 2026-05-04
+********************************************************************************/
+
+DECLARE @emisores VARCHAR(MAX) = 'SODX'; -- Nemonicos separados por coma
+DECLARE @usuario VARCHAR(100) = 'YULIANA.GALLO'; -- Null para migrar todo el emisor
+DECLARE @PadreMasRepetido INT;
+DECLARE @ProcesoNombre VARCHAR(100) = 'MIGRACION_USUARIOS_DINAMICA';
+DECLARE @MensajeLog NVARCHAR(MAX);
+DECLARE @CantUsuarios INT = 0;
+DECLARE @CantEstablecimientos INT = 0;
+DECLARE @CantBorrados INT = 0;
+
+BEGIN TRY
+    -- 0. Log de Inicio
+    SET @MensajeLog = CONCAT('Iniciando migración para emisores: ', @emisores, ' | Usuario: ', ISNULL(@usuario, 'TODOS'));
+    EXEC [master].[dbo].[spct_insertar_alerta_postgres]
+        @severity = 'Info',
+        @process = @ProcesoNombre,
+        @country = NULL,
+        @issuing = @emisores,
+        @message = @MensajeLog,
+        @extra_info = '{}';
+
+    -- 1. Obtener el us_id_padre que más se repite para este emisor en Local
+    -- Se toma el primero de la lista de emisores para determinar el padre
+    SELECT TOP 1 @PadreMasRepetido = us_id_padre
+    FROM sat_seguridad..se_usuario 
+    INNER JOIN sat_catalogo..sc_emisor ON em_id_emisor = us_id_emisor
+    WHERE em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+    GROUP BY us_id_padre
+    ORDER BY COUNT(1) DESC;
+    
+    SET @PadreMasRepetido = ISNULL(@PadreMasRepetido, 0);
+    
+    SET @MensajeLog = CONCAT('Padre detectado/asignado: ', @PadreMasRepetido);
+    PRINT @MensajeLog;
+
+    --------------------------------------------------------------------------------
+    -- 2. LIMPIEZA
+    --------------------------------------------------------------------------------
+    -- Borrar establecimientos
+    DELETE eepp
+    FROM sat_seguridad.dbo.se_usuario_establecimiento_punto eepp
+    INNER JOIN sat_seguridad.dbo.se_usuario us ON us.us_id_usuario = eepp.ep_id_usuario
+    INNER JOIN sat_catalogo.dbo.sc_emisor em ON em.em_id_emisor = us.us_id_emisor
+    WHERE em.em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+      AND (@usuario IS NULL OR us.us_login = @usuario);
+    
+    SET @CantBorrados = @@ROWCOUNT;
+
+    -- Borrar usuarios
+    DELETE us
+    FROM sat_seguridad..se_usuario us
+    INNER JOIN sat_catalogo.dbo.sc_emisor em ON us.us_id_emisor = em.em_id_emisor
+    WHERE em.em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+      AND (@usuario IS NULL OR us.us_login = @usuario);
+    
+    SET @CantBorrados = @CantBorrados + @@ROWCOUNT;
+
+    SET @MensajeLog = CONCAT('Limpieza completada. Registros eliminados: ', @CantBorrados);
+    PRINT @MensajeLog;
+
+    --------------------------------------------------------------------------------
+    -- 3. INSERCIÓN DE USUARIOS CON PADRE DINÁMICO
+    --------------------------------------------------------------------------------
+    INSERT INTO sat_seguridad.dbo.[se_usuario]
+        ([us_estado], [us_id_padre], [us_id_emisor], [us_login], [us_password], 
+         [us_identificacion], [us_tipo_usuario], [us_nombres], [us_apellido1], 
+         [us_apellido2], [us_descripcion], [us_mail], [us_usa_doble_factor], 
+         [us_doble_factor_secret], [us_fecha_doble_factor])
+    SELECT 
+        origen.[us_estado],
+        @PadreMasRepetido,
+        (SELECT em_id_emisor FROM sat_catalogo..sc_emisor WHERE em_nemonico = CatOrigen.em_nemonico),
+        origen.[us_login],
+        origen.[us_password],
+        origen.[us_identificacion],
+        origen.[us_tipo_usuario],
+        origen.[us_nombres],
+        origen.[us_apellido1],
+        origen.[us_apellido2],
+        origen.[us_descripcion],
+        origen.[us_mail],
+        origen.[us_usa_doble_factor],
+        origen.[us_doble_factor_secret],
+        origen.[us_fecha_doble_factor]
+    FROM sat_seguridad_w5..se_usuario origen
+    INNER JOIN sat_catalogo_w5.dbo.sc_emisor as CatOrigen ON CatOrigen.em_id_emisor = origen.us_id_emisor
+    LEFT JOIN sat_seguridad..se_usuario destino ON origen.us_login = destino.us_login 
+        AND destino.us_id_emisor = (SELECT em_id_emisor FROM sat_catalogo..sc_emisor WHERE em_nemonico = CatOrigen.em_nemonico)
+    WHERE destino.us_login IS NULL 
+      AND origen.us_estado = 0      
+      AND CatOrigen.em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+      AND (@usuario IS NULL OR origen.us_login = @usuario);
+
+    SET @CantUsuarios = @@ROWCOUNT;
+
+    --------------------------------------------------------------------------------
+    -- 4. INSERCIÓN DE ESTABLECIMIENTOS
+    --------------------------------------------------------------------------------
+    INSERT INTO [sat_seguridad].[dbo].[se_usuario_establecimiento_punto]
+        ([ep_id_usuario], [ep_id_emisor], [ep_codigo_establecimiento], [ep_codigo_punto])
+    SELECT DISTINCT  
+        us_dest.us_id_usuario,
+        us_dest.us_id_emisor,
+        w5.Establecimiento,
+        w5.Punto        
+    FROM sat_seguridad.dbo.se_usuario us_dest
+    INNER JOIN sat_catalogo.dbo.sc_emisor em ON us_dest.us_id_emisor = em.em_id_emisor
+    INNER JOIN (
+        SELECT DISTINCT 
+            em_orig.em_nemonico as Nemonico, 
+            us_orig.us_login as [Login], 
+            ep.ep_codigo_establecimiento as Establecimiento,
+            ep.ep_codigo_punto as Punto        
+        FROM [sat_seguridad_w5].dbo.[se_usuario_establecimiento_punto] ep
+        INNER JOIN sat_seguridad_w5.dbo.se_usuario us_orig ON us_orig.us_id_usuario = ep.ep_id_usuario
+        INNER JOIN sat_catalogo_w5.dbo.sc_emisor em_orig ON us_orig.us_id_emisor = em_orig.em_id_emisor
+        WHERE em_orig.em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+          AND (@usuario IS NULL OR us_orig.us_login = @usuario)
+    ) AS w5 ON w5.Nemonico = em.em_nemonico AND w5.[Login] = us_dest.us_login
+    WHERE em.em_nemonico IN (SELECT value FROM STRING_SPLIT(@emisores, ','))
+      AND (@usuario IS NULL OR us_dest.us_login = @usuario);
+
+    SET @CantEstablecimientos = @@ROWCOUNT;
+
+    -- 5. Log de Éxito
+    SET @MensajeLog = CONCAT('Migración exitosa. Usuarios: ', @CantUsuarios, ', Establecimientos: ', @CantEstablecimientos);
+    EXEC [master].[dbo].[spct_insertar_alerta_postgres]
+        @severity = 'Success',
+        @process = @ProcesoNombre,
+        @country = NULL,
+        @issuing = @emisores,
+        @message = @MensajeLog,
+        @extra_info = '{}';
+
+    PRINT @MensajeLog;
+
+    -- 6. Verificación Final (Opcional, se mantiene del original)
+    SELECT (SELECT us_login FROM sat_seguridad_w5..se_usuario pa WHERE pa.us_id_usuario = us.us_id_padre) as PadreW5,
+           * FROM sat_seguridad_w5..se_usuario us WHERE us_login = @usuario;
+   
+    SELECT (SELECT us_login FROM sat_seguridad..se_usuario pa WHERE pa.us_id_usuario = us.us_id_padre) as Padre,
+           * FROM sat_seguridad..se_usuario us WHERE us_login = @usuario;
+
+END TRY
+BEGIN CATCH
+    DECLARE @ErrorMessage NVARCHAR(MAX) = ERROR_MESSAGE();
+    
+    -- Log de Error
+    EXEC [master].[dbo].[spct_insertar_alerta_postgres]
+        @severity = 'Error',
+        @process = @ProcesoNombre,
+        @country = NULL,
+        @issuing = @emisores,
+        @message = @ErrorMessage,
+        @extra_info = '{"Accion": "Fallo en migración de usuarios"}';
+
+    PRINT 'ERROR: ' + @ErrorMessage;
+    -- Opcional: THROW;
+END CATCH
